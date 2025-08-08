@@ -331,7 +331,10 @@ def process_single_query(
     return qa
 
 def calculate_metrics(qa, top_k=100, ndcg_k=10):
-    """计算单个QA对的评估指标（对比retrieved和evidences）"""
+    """计算单个QA对的评估指标
+    只要黄金段落被包含在检索到的句子中就算检索到
+    因为句子可能被处理为（标题+句子），不能直接匹配
+    """
     retrieved = qa.get("retrieved", [])
     gold_evidences = qa.get("evidences", [])  # 黄金段落列表
     
@@ -342,28 +345,37 @@ def calculate_metrics(qa, top_k=100, ndcg_k=10):
             "matched_evidences": []
         }
     
-    # 计算recall@100：检索结果中有多少黄金段落
+    # 计算recall@100：检查黄金段落是否被包含在检索结果中
     matched = []
-    for i, doc in enumerate(retrieved[:top_k]):
-        if doc in gold_evidences:
-            matched.append({
-                "rank": i + 1,
-                "text": doc,
-                "gold_position": gold_evidences.index(doc) + 1
-            })
+    for gold_idx, gold_doc in enumerate(gold_evidences):
+        # 在检索结果中查找是否包含当前黄金段落
+        for rank, retrieved_doc in enumerate(retrieved[:top_k], 1):
+            # 判断黄金段落是否被包含在检索到的句子中
+            if gold_doc in retrieved_doc:
+                matched.append({
+                    "rank": rank,
+                    "text": retrieved_doc,  # 存储实际检索到的完整句子
+                    "gold_text": gold_doc,  # 存储对应的黄金段落
+                    "gold_position": gold_idx + 1
+                })
+                break  # 找到第一个匹配就停止当前黄金段落的搜索
     
+    # 计算召回率：匹配到的黄金段落数量 / 总黄金段落数量
     recall = len(matched) / len(gold_evidences)
     
-    # 计算NDCG@10：需要构造相关性向量
+    # 计算NDCG@10
     y_true = np.zeros(ndcg_k)
     y_score = np.zeros(ndcg_k)
     
-    for i, doc in enumerate(retrieved[:ndcg_k]):
-        if doc in gold_evidences:
-            # 相关性得分可以根据黄金段落的顺序加权（越靠前的黄金段落权重越高）
-            relevance = 1.0 / (gold_evidences.index(doc) + 1)  
-            y_true[i] = relevance
-            y_score[i] = 1.0  # 预测得分
+    for rank, retrieved_doc in enumerate(retrieved[:ndcg_k], 1):
+        # 检查当前检索到的句子是否包含任何黄金段落
+        for gold_idx, gold_doc in enumerate(gold_evidences):
+            if gold_doc in retrieved_doc:
+                # 根据黄金段落的重要性赋予相关性得分
+                relevance = 1.0 / (gold_idx + 1)
+                y_true[rank - 1] = relevance
+                y_score[rank - 1] = 1.0  # 标记为相关
+                break  # 找到一个匹配即可
     
     ndcg = ndcg_score([y_true], [y_score]) if np.any(y_true) else 0.0
     
@@ -567,21 +579,24 @@ def bm25_search(index, query, collection, top_k=150):
 if __name__ == "__main__":
     # 1.配置参数
     PARENT_CHUNK_SIZE = 1500  # 父块大小
-    CHILD_CHUNK_SIZE = 300    # 子块大小
-    BATCH_SIZE = 2000          # 批量处理大小
+    CHILD_CHUNK_SIZE = 300  # 子块大小
+    BATCH_SIZE = 2000 # 向量数据库批量处理大小
     DB_PATHS = {
         "child": "./child_chroma",
         "parent": "./parent_chroma",
         "bm25": "./bm25_child.json"
-    }
-    CORPUS_PATH = ["cqa_title.txt"]
+    }  # 向量数据存储地址
+    CORPUS_PATH = ["cqa_title.txt"]  # 待处理的文档
     RETRIEVE_TOPK = 100  # 子块检索数量
     FINAL_TOPK = 100  # 最终检索数量
-    MAX_WORKERS = min(3, os.cpu_count())  # retrieve工作线程数
-    USE_HYBRID = True
-    USE_RERANK = True
-    USE_FATHER = False
-    CLEAN_HISTORY = True
+    MAX_WORKERS = min(2, os.cpu_count())  # 向量检索器工作线程数
+    USE_HYBRID = True  # 是否使用向量+BM25混合检索
+    USE_RERANK = True  # 是否使用重排器
+    USE_FATHER = False  # 是否扩展父块
+    CLEAN_HISTORY = True  # 是否清除旧的向量数据库
+    MODELS_DIR = "./models"
+    EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"  # "facebook/dragon-plus-context-encoder"
+    RERANK_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     
     # 2.清理旧数据
     if CLEAN_HISTORY:
@@ -589,16 +604,18 @@ if __name__ == "__main__":
 
     # 3.初始化各个组件
     # 初始化嵌入模型
+    print(f"初始化嵌入模型 {EMBEDDING_MODEL}\n")
     embeddings = HuggingFaceEmbeddings(
-        # model_name="BAAI/bge-small-zh-v1.5",
-        model_name="facebook/dragon-plus-context-encoder",
+        model_name=EMBEDDING_MODEL,
+        cache_folder=MODELS_DIR,
         model_kwargs={'device': 'cuda'},
         encode_kwargs={'normalize_embeddings': True}
     )
 
     # 初始化重排器
+    print(f"初始化重排器 {RERANK_MODEL}\n")
     reranker = load_reranker(
-        model_name="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        model_name=RERANK_MODEL,
         device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
